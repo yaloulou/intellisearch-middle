@@ -165,16 +165,23 @@ interface IntelIncidentDocument {
     source_ref?: string;
   };
   degats_humains: {
-    morts: number;
-    blesses: number;
+    morts_civils: number;
+    morts_allies: number;
+    morts_ennemis: number;
+    blesses_civils: number;
+    blesses_allies: number;
+    blesses_ennemis: number;
     enleves_disparus: number;
     expulses: number;
+    arrestations_interpellations: number;
+    violences_sexuelles: number;
   };
   degats_materiels: {
     degat_vehicules: number;
     degat_batiments: number;
     degat_infrastructures: number;
     autres_degats: string;
+    autres_bilans: string;
   };
   classification?: {
     level?: string;
@@ -187,7 +194,6 @@ interface IntelIncidentDocument {
     updated_by?: string;
   };
   owner_id?: string;
-  desk?: string;
 }
 
 export interface SearchEntitiesInput {
@@ -702,8 +708,6 @@ export class ElasticsearchService {
     if (user) {
       if (user.role === Role.OFFICIER) {
         filters.push({ term: { owner_id: user.sub } });
-      } else if (user.role === Role.ANALYSTE || user.role === Role.CONSEILLER) {
-        if (user.desk) filters.push({ term: { desk: user.desk } });
       }
     }
 
@@ -756,9 +760,6 @@ export class ElasticsearchService {
       if (user.role === Role.OFFICIER && src?.owner_id !== user.sub) {
         throw new HttpException('Accès refusé', HttpStatus.FORBIDDEN);
       }
-      if ((user.role === Role.ANALYSTE || user.role === Role.CONSEILLER) && src?.desk !== user.desk) {
-        throw new HttpException('Accès refusé', HttpStatus.FORBIDDEN);
-      }
     }
 
     return {
@@ -778,9 +779,6 @@ export class ElasticsearchService {
       ...normalizedPayload,
       ...(user ? {
         owner_id: user.sub,
-        desk: user.role === Role.OFFICIER
-          ? (user.desk ?? '')
-          : (this.normalizeString(payload.desk as string | undefined) ?? user.desk ?? ''),
         audit: {
           ...(normalizedPayload.audit ?? {}),
           ...(!explicitId ? { created_at: now, created_by: user.sub } : {}),
@@ -905,8 +903,16 @@ export class ElasticsearchService {
         'event.description',
         'location.province_region',
         'location.territoire_ville',
-        'degats_humains.morts',
-        'degats_humains.blesses',
+        'degats_humains.morts_civils',
+        'degats_humains.morts_allies',
+        'degats_humains.morts_ennemis',
+        'degats_humains.blesses_civils',
+        'degats_humains.blesses_allies',
+        'degats_humains.blesses_ennemis',
+        'degats_humains.enleves_disparus',
+        'degats_humains.expulses',
+        'degats_humains.arrestations_interpellations',
+        'degats_humains.violences_sexuelles',
       ],
       sort: [{ 'event.date_event': { order: 'desc' } }],
       query: filters.length > 0
@@ -1411,16 +1417,23 @@ export class ElasticsearchService {
             ? { source_name: this.normalizeString(payload.source) }
             : undefined),
       degats_humains: {
-        morts: this.toNonNegativeInteger(degatsHumains.morts),
-        blesses: this.toNonNegativeInteger(degatsHumains.blesses),
+        morts_civils: this.toNonNegativeInteger(degatsHumains.morts_civils ?? degatsHumains.morts),
+        morts_allies: this.toNonNegativeInteger(degatsHumains.morts_allies),
+        morts_ennemis: this.toNonNegativeInteger(degatsHumains.morts_ennemis),
+        blesses_civils: this.toNonNegativeInteger(degatsHumains.blesses_civils ?? degatsHumains.blesses),
+        blesses_allies: this.toNonNegativeInteger(degatsHumains.blesses_allies),
+        blesses_ennemis: this.toNonNegativeInteger(degatsHumains.blesses_ennemis),
         enleves_disparus: this.toNonNegativeInteger(degatsHumains.enleves_disparus),
         expulses: this.toNonNegativeInteger(degatsHumains.expulses),
+        arrestations_interpellations: this.toNonNegativeInteger(degatsHumains.arrestations_interpellations),
+        violences_sexuelles: this.toNonNegativeInteger(degatsHumains.violences_sexuelles),
       },
       degats_materiels: {
         degat_vehicules: this.toNonNegativeInteger(degatsMateriels.degat_vehicules),
         degat_batiments: this.toNonNegativeInteger(degatsMateriels.degat_batiments),
         degat_infrastructures: this.toNonNegativeInteger(degatsMateriels.degat_infrastructures),
         autres_degats: this.normalizeString((degatsMateriels.autres_degats as string | undefined) ?? undefined) ?? '',
+        autres_bilans: this.normalizeString((degatsMateriels.autres_bilans as string | undefined) ?? undefined) ?? '',
       },
       classification: {
         level: this.normalizeString((classification.level as string | undefined) ?? undefined) ?? 'OUVERT',
