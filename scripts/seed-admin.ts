@@ -10,11 +10,12 @@
 
 import 'dotenv/config';
 import * as bcrypt from 'bcrypt';
+import { appConfig } from '../src/config/app.config';
 
-const ES_URL = (process.env.ELASTICSEARCH_URL ?? 'http://localhost:9200').replace(/\/+$/, '');
-const ES_USER = process.env.ELASTICSEARCH_USERNAME;
-const ES_PASS = process.env.ELASTICSEARCH_PASSWORD;
-const INDEX = process.env.ELASTICSEARCH_INDEX_USERS ?? 'users_v1';
+const ES_URL = appConfig.elasticsearch.url;
+const ES_USER = appConfig.elasticsearch.username;
+const ES_PASS = appConfig.elasticsearch.password;
+const INDEX = appConfig.elasticsearch.indexes.users;
 
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL ?? 'admin@intellisearch.local';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD ?? 'Admin@1234!';

@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
+import { appConfig } from './config/app.config';
 import { AllExceptionsFilter } from './http-exception.filter';
 
 async function bootstrap() {
@@ -10,6 +11,6 @@ async function bootstrap() {
     origin: true,
     credentials: true,
   });
-  await app.listen(process.env.PORT ?? 3000);
+  await app.listen(appConfig.port);
 }
 bootstrap();

@@ -1,5 +1,6 @@
 import { HttpException, HttpStatus, Injectable } from '@nestjs/common';
 import { randomBytes } from 'node:crypto';
+import { appConfig } from '../config/app.config';
 import { Role } from '../common/constants/roles.constant';
 import type { JwtPayload } from '../common/interfaces/jwt-payload.interface';
 
@@ -390,15 +391,15 @@ function isRecord(value: unknown): value is UnknownRecord {
 
 @Injectable()
 export class ElasticsearchService {
-  private readonly esBaseUrl = (process.env.ELASTICSEARCH_URL ?? 'http://localhost:9200').replace(/\/+$/, '');
-  private readonly esUsername = process.env.ELASTICSEARCH_USERNAME;
-  private readonly esPassword = process.env.ELASTICSEARCH_PASSWORD;
-  private readonly linksIndex = process.env.ELASTICSEARCH_INDEX_LINKS ?? 'links_v1';
-  private readonly entitiesIndex = process.env.ELASTICSEARCH_INDEX_ENTITIES ?? 'entities_v1';
-  private readonly intelIndex = process.env.ELASTICSEARCH_INDEX_INTEL ?? 'intel_v1';
-  private readonly observationsIndex = process.env.ELASTICSEARCH_INDEX_OBSERVATIONS ?? 'observations_v1';
-  private readonly eventsIndex = process.env.ELASTICSEARCH_INDEX_EVENTS ?? 'events_v1';
-  private readonly documentsIndex = process.env.ELASTICSEARCH_INDEX_DOCUMENTS ?? 'documents_v1';
+  private readonly esBaseUrl = appConfig.elasticsearch.url;
+  private readonly esUsername = appConfig.elasticsearch.username;
+  private readonly esPassword = appConfig.elasticsearch.password;
+  private readonly linksIndex = appConfig.elasticsearch.indexes.links;
+  private readonly entitiesIndex = appConfig.elasticsearch.indexes.entities;
+  private readonly intelIndex = appConfig.elasticsearch.indexes.intel;
+  private readonly observationsIndex = appConfig.elasticsearch.indexes.observations;
+  private readonly eventsIndex = appConfig.elasticsearch.indexes.events;
+  private readonly documentsIndex = appConfig.elasticsearch.indexes.documents;
 
   async searchEntities(input: SearchEntitiesInput) {
     const queryText = this.normalizeString(input.query ?? input.q);

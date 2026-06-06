@@ -1,5 +1,6 @@
 import { ConflictException, HttpException, HttpStatus, Injectable, NotFoundException } from '@nestjs/common';
 import * as bcrypt from 'bcrypt';
+import { appConfig } from '../config/app.config';
 import type { Role } from '../common/constants/roles.constant';
 
 // ── Interfaces ──────────────────────────────────────────────────────────────
@@ -39,10 +40,10 @@ interface EsDocResponse {
 
 @Injectable()
 export class UsersService {
-  private readonly esBaseUrl = (process.env.ELASTICSEARCH_URL ?? 'http://localhost:9200').replace(/\/+$/, '');
-  private readonly esUsername = process.env.ELASTICSEARCH_USERNAME;
-  private readonly esPassword = process.env.ELASTICSEARCH_PASSWORD;
-  private readonly usersIndex = process.env.ELASTICSEARCH_INDEX_USERS ?? 'users_v1';
+  private readonly esBaseUrl = appConfig.elasticsearch.url;
+  private readonly esUsername = appConfig.elasticsearch.username;
+  private readonly esPassword = appConfig.elasticsearch.password;
+  private readonly usersIndex = appConfig.elasticsearch.indexes.users;
 
   // ── Public methods ────────────────────────────────────────────────────────
 
