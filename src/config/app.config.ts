@@ -16,4 +16,8 @@ export const appConfig = {
       users: process.env.ELASTICSEARCH_INDEX_USERS ?? 'users_v1',
     },
   },
+  uploads: {
+    dir: process.env.UPLOADS_DIR ?? 'uploads',
+    publicPath: process.env.UPLOADS_PUBLIC_PATH ?? '/uploads',
+  },
 } as const;

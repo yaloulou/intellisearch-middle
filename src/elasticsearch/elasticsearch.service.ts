@@ -1,5 +1,7 @@
 import { HttpException, HttpStatus, Injectable } from '@nestjs/common';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
+import { mkdir, writeFile } from 'node:fs/promises';
+import { extname, posix, resolve } from 'node:path';
 import { appConfig } from '../config/app.config';
 import { Role } from '../common/constants/roles.constant';
 import type { JwtPayload } from '../common/interfaces/jwt-payload.interface';
@@ -512,6 +514,81 @@ export class ElasticsearchService {
     return {
       id: response._id ?? entityId,
       result: response.result ?? 'deleted',
+    };
+  }
+
+  async uploadEntityPhoto(file: any, user?: JwtPayload) {
+    if (!file) {
+      throw new HttpException('Aucune photo fournie', HttpStatus.BAD_REQUEST);
+    }
+
+    const mime = this.normalizeString(file.mimetype) ?? '';
+    if (!mime.startsWith('image/')) {
+      throw new HttpException('Le fichier doit être une image', HttpStatus.BAD_REQUEST);
+    }
+
+    const buffer = Buffer.isBuffer(file.buffer) ? file.buffer : null;
+    if (!buffer || buffer.length === 0) {
+      throw new HttpException('Photo invalide ou vide', HttpStatus.BAD_REQUEST);
+    }
+
+    const maxSizeBytes = 5 * 1024 * 1024;
+    if (buffer.length > maxSizeBytes) {
+      throw new HttpException('La photo ne doit pas dépasser 5 Mo', HttpStatus.BAD_REQUEST);
+    }
+
+    const safeExtension = this.resolveImageExtension(file.originalname, mime);
+    const sha256 = createHash('sha256').update(buffer).digest('hex');
+    const filename = `entity_${Date.now()}_${randomBytes(6).toString('hex')}${safeExtension}`;
+    const relativePath = posix.join('entities', filename);
+    const uploadsRoot = resolve(appConfig.uploads.dir);
+    const entityUploadsDir = resolve(uploadsRoot, 'entities');
+    const absolutePath = resolve(entityUploadsDir, filename);
+
+    if (!absolutePath.startsWith(entityUploadsDir)) {
+      throw new HttpException('Chemin de fichier invalide', HttpStatus.BAD_REQUEST);
+    }
+
+    await mkdir(entityUploadsDir, { recursive: true });
+    await writeFile(absolutePath, buffer);
+
+    const publicUrl = `${appConfig.uploads.publicPath}/${relativePath}`.replace(/\\/g, '/');
+    const now = new Date().toISOString();
+    const savedDocument = await this.saveDocument({
+      title: file.originalname || filename,
+      doc_type: 'entity_photo',
+      origin: {
+        source_type: 'upload',
+        source_name: user?.email ?? user?.sub ?? 'application',
+      },
+      file: {
+        sha256,
+        mime,
+        path: relativePath,
+        url: publicUrl,
+      },
+      tags: ['entity-photo'],
+      classification: { level: 'INTERNE', compartments: [] },
+      audit: {
+        created_at: now,
+        updated_at: now,
+        created_by: user?.sub,
+        updated_by: user?.sub,
+      },
+    });
+
+    const docId = savedDocument.id;
+    return {
+      doc_id: docId,
+      id: docId,
+      url: publicUrl,
+      file_path: relativePath,
+      media_ref: {
+        doc_id: docId,
+        media_type: 'image',
+        role: 'profile',
+      },
+      document: savedDocument.item,
     };
   }
 
@@ -1557,6 +1634,20 @@ export class ElasticsearchService {
 
     const trimmed = value.trim();
     return trimmed.length > 0 ? trimmed : undefined;
+  }
+
+  private resolveImageExtension(originalName: unknown, mime: string): string {
+    const fromName = typeof originalName === 'string' ? extname(originalName).toLowerCase() : '';
+    const allowed = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif']);
+    if (allowed.has(fromName)) return fromName;
+
+    const byMime: Record<string, string> = {
+      'image/jpeg': '.jpg',
+      'image/png': '.png',
+      'image/webp': '.webp',
+      'image/gif': '.gif',
+    };
+    return byMime[mime] ?? '.jpg';
   }
 
   private toIsoDate(value: unknown): string | null {

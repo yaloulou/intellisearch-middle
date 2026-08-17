@@ -1,4 +1,5 @@
-import { Body, Controller, Delete, Get, Param, Post, Put, Query } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Post, Put, Query, UploadedFile, UseInterceptors } from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
 import { ElasticsearchService } from './elasticsearch.service';
 import type { IntelDashboardInput, SearchDocumentsInput, SearchEntitiesInput, SearchEventsInput, SearchIntelInput, SearchLinksInput, SearchObservationsInput } from './elasticsearch.service';
 import { Roles } from '../common/decorators/roles.decorator';
@@ -45,6 +46,13 @@ export class ElasticsearchController {
   @Roles(Role.ADMIN)
   deleteEntity(@Param('id') id: string) {
     return this.elasticsearchService.deleteEntity(id);
+  }
+
+  @Post('uploads/entity-photo')
+  @Roles(...AnalysteAndAbove)
+  @UseInterceptors(FileInterceptor('photo'))
+  uploadEntityPhoto(@UploadedFile() file: any, @CurrentUser() user: JwtPayload) {
+    return this.elasticsearchService.uploadEntityPhoto(file, user);
   }
 
   // ── Links / Relations ───────────────────────────────────────────────────────
