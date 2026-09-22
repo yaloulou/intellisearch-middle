@@ -202,6 +202,9 @@ interface IntelIncidentDocument {
 export interface SearchEntitiesInput {
   query?: string;
   q?: string;
+  entity_type?: string;
+  status?: string;
+  watchlist?: boolean;
   size?: number;
 }
 
@@ -405,16 +408,12 @@ export class ElasticsearchService {
 
   async searchEntities(input: SearchEntitiesInput) {
     const queryText = this.normalizeString(input.query ?? input.q);
-    if (!queryText) {
-      return {
-        count: 0,
-        items: [],
-      };
-    }
-
     const size = this.resolveSize(input.size, 20, 100);
-    const body = {
-      query: {
+    const must: UnknownRecord[] = [];
+    const filters: UnknownRecord[] = [];
+
+    if (queryText && queryText !== '*') {
+      must.push({
         bool: {
           should: [
             {
@@ -436,9 +435,28 @@ export class ElasticsearchService {
           ],
           minimum_should_match: 1,
         },
-      },
+      });
+    }
+
+    const entityType = this.normalizeString(input.entity_type);
+    if (entityType) {
+      filters.push({ term: { entity_type: entityType } });
+    }
+
+    const status = this.normalizeString(input.status);
+    if (status) {
+      filters.push({ term: { status } });
+    }
+
+    if (typeof input.watchlist === 'boolean') {
+      filters.push({ term: { 'risk.watchlist': input.watchlist } });
+    }
+
+    const body = {
+      query: must.length || filters.length
+        ? { bool: { must, filter: filters } }
+        : { match_all: {} },
       size,
-      _source: ['name', 'entity_type', 'entity_id', 'aliases'],
     };
 
     const response = await this.requestToElasticsearch<ElasticsearchSearchResponse<EntityDocument>>(
@@ -455,9 +473,7 @@ export class ElasticsearchService {
         id: hit._id,
         value: hit._id,
         text: hit._source?.name ?? 'Sans nom',
-        name: hit._source?.name ?? 'Sans nom',
-        entity_type: hit._source?.entity_type ?? 'unknown',
-        aliases: hit._source?.aliases ?? [],
+        ...(hit._source ?? {}),
       })),
     };
   }
@@ -1971,6 +1987,7 @@ export class ElasticsearchService {
     const lieu = isRecord(attributes.lieu) ? attributes.lieu : null;
     const geoLieu = lieu && isRecord(lieu.geo) ? lieu.geo : null;
     const risk = isRecord(payload.risk) ? payload.risk : null;
+    const legacyWatchlist = typeof payload.watchlist === 'boolean' ? payload.watchlist : undefined;
     const classification = isRecord(payload.classification) ? payload.classification : {};
     const audit = isRecord(payload.audit) ? payload.audit : {};
 
@@ -2067,11 +2084,11 @@ export class ElasticsearchService {
       }));
     }
 
-    if (risk) {
+    if (risk || legacyWatchlist !== undefined) {
       normalized.risk = {
-        risk_score: this.toNullableNumber(risk.risk_score),
-        risk_level: this.normalizeString((risk.risk_level as string | undefined) ?? undefined),
-        watchlist: typeof risk.watchlist === 'boolean' ? risk.watchlist : undefined,
+        risk_score: risk ? this.toNullableNumber(risk.risk_score) : null,
+        risk_level: risk ? this.normalizeString((risk.risk_level as string | undefined) ?? undefined) : undefined,
+        watchlist: risk && typeof risk.watchlist === 'boolean' ? risk.watchlist : legacyWatchlist,
       };
     }
 
