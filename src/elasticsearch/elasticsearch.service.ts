@@ -45,6 +45,7 @@ interface ElasticsearchAggregationResponse {
 interface EntityDocument {
   entity_type?: string;
   name?: string;
+  description?: string;        // ← AJOUT
   aliases?: string[];
   attributes?: {
     person?: {
@@ -1994,6 +1995,7 @@ export class ElasticsearchService {
     const normalized: EntityDocument = {
       entity_type: this.normalizeString((payload.entity_type as string | undefined) ?? undefined) ?? '',
       name: this.normalizeString((payload.name as string | undefined) ?? undefined) ?? '',
+      description: this.normalizeString((payload.description as string | undefined) ?? undefined),  // ← AJOUT
       aliases: this.toStringArray(payload.aliases),
       status: this.normalizeString((payload.status as string | undefined) ?? undefined),
       labels: this.toStringArray(payload.labels),
