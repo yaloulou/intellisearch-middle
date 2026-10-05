@@ -1,8 +1,12 @@
-import { Body, Controller, Delete, Get, Param, Post, Put, Query, UploadedFile, UseInterceptors } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Post, Put, Query, UploadedFile, UseInterceptors, Res, HttpException, HttpStatus } from '@nestjs/common';
+import type { Response } from 'express';
+import { MAX_EVIDENCE_BYTES } from './evidence';
+import type { EvidenceFile } from './evidence';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { ElasticsearchService } from './elasticsearch.service';
 import type { IntelDashboardInput, SearchDocumentsInput, SearchEntitiesInput, SearchEventsInput, SearchIntelInput, SearchLinksInput, SearchObservationsInput } from './elasticsearch.service';
 import { Roles } from '../common/decorators/roles.decorator';
+import { CcocOnly } from '../common/decorators/ccoc-only.decorator';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { Role } from '../common/constants/roles.constant';
 import type { JwtPayload } from '../common/interfaces/jwt-payload.interface';
@@ -53,6 +57,39 @@ export class ElasticsearchController {
   @UseInterceptors(FileInterceptor('photo'))
   uploadEntityPhoto(@UploadedFile() file: any, @CurrentUser() user: JwtPayload) {
     return this.elasticsearchService.uploadEntityPhoto(file, user);
+  }
+
+  @Post('uploads/evidence')
+  @Roles(...AllRoles)
+  @UseInterceptors(FileInterceptor('file', { limits: { fileSize: MAX_EVIDENCE_BYTES, files: 1, fields: 2 } }))
+  uploadEvidence(@UploadedFile() file: EvidenceFile, @Body('context') context: string,
+    @Body('classification') classification: string, @CurrentUser() user: JwtPayload) {
+    return this.elasticsearchService.uploadEvidence(file, context, classification, user);
+  }
+
+  @Get('evidence/:id')
+  @Roles(...AllRoles)
+  getEvidence(@Param('id') id: string, @Query('context') context: string,
+    @Query('recordId') recordId: string, @CurrentUser() user: JwtPayload) {
+    return this.elasticsearchService.getEvidenceById(id, user, context, recordId);
+  }
+
+  @Get('evidence/:id/file')
+  @Roles(...AllRoles)
+  async getEvidenceFile(@Param('id') id: string, @Query('context') context: string,
+    @Query('recordId') recordId: string, @CurrentUser() user: JwtPayload, @Res() response: Response) {
+    const file = await this.elasticsearchService.getEvidenceFile(id, user, context, recordId);
+    response.setHeader('Content-Type', file.mime);
+    response.setHeader('X-Content-Type-Options', 'nosniff');
+    response.setHeader('Cache-Control', 'private, no-store');
+    response.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(file.title)}`);
+    await new Promise<void>((resolve, reject) => {
+      response.sendFile(file.path, (error) => {
+        if (!error) resolve();
+        else if (response.headersSent) resolve();
+        else reject(new HttpException('Fichier introuvable ou indisponible', HttpStatus.NOT_FOUND));
+      });
+    });
   }
 
   // ── Links / Relations ───────────────────────────────────────────────────────
@@ -110,7 +147,8 @@ export class ElasticsearchController {
   // ── Intel (Renseignements) ──────────────────────────────────────────────────
 
   @Get('intel')
-  @Roles(...AllRoles)
+  @Roles(Role.ANALYSTE, Role.ADMIN)
+  @CcocOnly()
   getIntel(
     @Query('search') search?: string,
     @Query('province_region') province_region?: string,
@@ -129,25 +167,29 @@ export class ElasticsearchController {
   }
 
   @Post('intel/search')
-  @Roles(...AllRoles)
+  @Roles(Role.ANALYSTE, Role.ADMIN)
+  @CcocOnly()
   searchIntel(@Body() body: SearchIntelInput = {}, @CurrentUser() user: JwtPayload) {
     return this.elasticsearchService.searchIntel(body, user);
   }
 
   @Get('intel/:id')
-  @Roles(...AllRoles)
+  @Roles(Role.ANALYSTE, Role.ADMIN)
+  @CcocOnly()
   getIntelById(@Param('id') id: string, @CurrentUser() user: JwtPayload) {
     return this.elasticsearchService.getIntelById(id, user);
   }
 
   @Post('intel')
-  @Roles(Role.OFFICIER, Role.COORDINATEUR, Role.ADMIN)
+  @Roles(Role.ANALYSTE, Role.ADMIN)
+  @CcocOnly()
   createIntel(@Body() body: Record<string, unknown> = {}, @CurrentUser() user: JwtPayload) {
     return this.elasticsearchService.saveIntel(body, undefined, user);
   }
 
   @Put('intel/:id')
-  @Roles(...CoordAndAdmin)
+  @Roles(Role.ANALYSTE, Role.ADMIN)
+  @CcocOnly()
   updateIntel(@Param('id') id: string, @Body() body: Record<string, unknown> = {}, @CurrentUser() user: JwtPayload) {
     return this.elasticsearchService.saveIntel(body, id, user);
   }
@@ -162,18 +204,21 @@ export class ElasticsearchController {
 
   @Get('intel-dashboard/provinces')
   @Roles(...AnalysteAndAbove)
+  @CcocOnly()
   getIntelProvinces() {
     return this.elasticsearchService.getIntelProvinces();
   }
 
   @Get('intel-dashboard/territoires')
   @Roles(...AnalysteAndAbove)
+  @CcocOnly()
   getIntelTerritoires(@Query('province') province: string) {
     return this.elasticsearchService.getIntelTerritoires(province);
   }
 
   @Get('intel-dashboard/data')
   @Roles(...AnalysteAndAbove)
+  @CcocOnly()
   getIntelDashboardGet(
     @Query('province') province?: string,
     @Query('territoire') territoire?: string,
@@ -187,6 +232,7 @@ export class ElasticsearchController {
 
   @Post('intel-dashboard/data')
   @Roles(...AnalysteAndAbove)
+  @CcocOnly()
   getIntelDashboardPost(@Body() body: IntelDashboardInput = {}) {
     return this.elasticsearchService.getIntelDashboard(body);
   }
@@ -217,6 +263,18 @@ export class ElasticsearchController {
     return this.elasticsearchService.searchObservations(body, user);
   }
 
+  @Get('observations/desks')
+  @Roles(...AllRoles)
+  observationDesks(@CurrentUser() user: JwtPayload) {
+    return this.elasticsearchService.listObservationDesks(user);
+  }
+
+  @Put('observations/:id/validation')
+  @Roles(...AllRoles)
+  validateObservation(@Param('id') id: string, @Body() body: Record<string, unknown> = {}, @CurrentUser() user: JwtPayload) {
+    return this.elasticsearchService.validateObservation(id, body, user);
+  }
+
   @Get('observations/:id')
   @Roles(...AllRoles)
   getObservationById(@Param('id') id: string, @CurrentUser() user: JwtPayload) {
@@ -224,21 +282,21 @@ export class ElasticsearchController {
   }
 
   @Post('observations')
-  @Roles(Role.OFFICIER, Role.COORDINATEUR, Role.ADMIN)
+  @Roles(...AllRoles)
   createObservation(@Body() body: Record<string, unknown> = {}, @CurrentUser() user: JwtPayload) {
     return this.elasticsearchService.saveObservation(body, undefined, user);
   }
 
   @Put('observations/:id')
-  @Roles(...CoordAndAdmin)
+  @Roles(...AllRoles)
   updateObservation(@Param('id') id: string, @Body() body: Record<string, unknown> = {}, @CurrentUser() user: JwtPayload) {
     return this.elasticsearchService.saveObservation(body, id, user);
   }
 
   @Delete('observations/:id')
-  @Roles(...CoordAndAdmin)
-  deleteObservation(@Param('id') id: string) {
-    return this.elasticsearchService.deleteObservation(id);
+  @Roles(...AllRoles)
+  deleteObservation(@Param('id') id: string, @CurrentUser() user: JwtPayload) {
+    return this.elasticsearchService.deleteObservation(id, user);
   }
 
   // ── Events ─────────────────────────────────────────────────────────────────
@@ -315,24 +373,24 @@ export class ElasticsearchController {
   @Get('documents/:id')
   @Roles(...AnalysteAndAbove)
   getDocumentById(@Param('id') id: string) {
-    return this.elasticsearchService.getDocumentById(id);
+    return this.elasticsearchService.getPublicDocument(id);
   }
 
   @Post('documents')
   @Roles(...CoordAndAdmin)
   createDocument(@Body() body: Record<string, unknown> = {}) {
-    return this.elasticsearchService.saveDocument(body);
+    return this.elasticsearchService.savePublicDocument(body);
   }
 
   @Put('documents/:id')
   @Roles(...CoordAndAdmin)
   updateDocument(@Param('id') id: string, @Body() body: Record<string, unknown> = {}) {
-    return this.elasticsearchService.saveDocument(body, id);
+    return this.elasticsearchService.savePublicDocument(body, id);
   }
 
   @Delete('documents/:id')
   @Roles(Role.ADMIN)
   deleteDocument(@Param('id') id: string) {
-    return this.elasticsearchService.deleteDocument(id);
+    return this.elasticsearchService.deletePublicDocument(id);
   }
 }

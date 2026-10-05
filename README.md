@@ -42,6 +42,55 @@ Définissez ces variables avant de lancer l'API :
 - `ELASTICSEARCH_INDEX_OBSERVATIONS` (défaut: `observations_v1`)
 - `ELASTICSEARCH_INDEX_EVENTS` (défaut: `events_v1`)
 
+### Accès CCOC
+
+Les menus Enregistrer CCOC et Rechercher CCOC, les pages CCOC et les routes
+`/api/intel` et `/api/intel-dashboard` sont réservés aux administrateurs et aux
+analystes dont le desk est `CCOC`. Le nom du desk est comparé sans tenir compte
+de la casse ni des espaces en début ou fin. Les autres rôles sont exclus, même
+avec ce desk. La suppression d'un CCOC reste réservée aux administrateurs.
+Après connexion, les autres comptes arrivent sur Informations.
+
+Validation : `node node_modules/jest/bin/jest.js src/auth/ccoc-access.spec.ts --runInBand`
+dans le backend et `node --test scripts/test-ccoc-access.cjs` dans le frontend.
+
+### Pièces jointes des informations et renseignements
+
+Les formulaires Informations (`observations_v1`) et Renseignements (`events_v1`)
+acceptent plusieurs images, vidéos, audios et documents : 20 fichiers par fiche,
+100 Mo par fichier. Le champ `evidence` des deux index doit être déclaré comme
+`nested`, avec `doc_id`, `type` et `sha256` de type `keyword`.
+
+- `POST /api/uploads/evidence` : multipart avec `file`, `context` (`observations`
+  ou `events`) et `classification` (JSON). Retourne `evidence` et `document`.
+- `GET /api/evidence/:id` : métadonnées de la pièce jointe.
+- `GET /api/evidence/:id/file` : téléchargement authentifié, avec prise en charge
+  des plages d'octets. Les deux routes GET acceptent `context` et `recordId` pour
+  vérifier l'accès à la fiche qui référence le fichier.
+- Les créations et modifications de fiches acceptent `evidence: [{ doc_id,
+  type, sha256 }]`. Une modification omettant `evidence` conserve les références
+  existantes ; un tableau vide retire toutes les références.
+
+Un document par fichier est enregistré dans `documents_v1`. Les fichiers sont
+stockés hors du dossier public `uploads`, dans `evidence-uploads` par défaut.
+La variable `EVIDENCE_UPLOADS_DIR` permet de choisir un dossier privé et persistant
+sur le serveur. Le compte exécutant le backend doit pouvoir écrire dans ce dossier.
+Le stockage des fichiers et l'index `documents_v1` doivent être sauvegardés ensemble.
+
+Les fichiers sont envoyés lors de l'enregistrement de la fiche. Après une erreur,
+les envois réussis restent dans le brouillon et seuls les fichiers restants sont
+renvoyés lors de la prochaine tentative. Retirer une pièce jointe supprime son lien
+avec la fiche, sans supprimer le document ni le fichier. Un brouillon abandonné
+après un envoi réussi peut laisser un fichier non rattaché.
+
+Formats acceptés : JPG, JPEG, PNG, GIF, WEBP, BMP ; MP4, WEBM, MOV, AVI, MKV, M4V ;
+MP3, WAV, OGG, OGA, M4A, AAC, FLAC ; PDF, TXT, CSV, RTF, DOC/DOCX, XLS/XLSX,
+PPT/PPTX, ODT/ODS/ODP. La lecture audio et vidéo dépend des formats pris en charge
+par le navigateur ; le téléchargement reste disponible.
+
+Validation : `node node_modules/jest/bin/jest.js src/elasticsearch/evidence.spec.ts --runInBand`
+dans le backend et `node --test scripts/test-evidence.cjs` dans le frontend.
+
 ### Endpoints disponibles
 
 - `POST /api/entities/search`
@@ -150,6 +199,60 @@ Définissez ces variables avant de lancer l'API :
 
 ```bash
 $ npm install
+```
+
+## Validation et distribution des informations
+
+Le desk `cord_intel` contrôle les observations. Il se sélectionne dans la gestion
+des comptes ; les comptes existants ne sont pas réaffectés automatiquement.
+
+- Une nouvelle observation reçoit `workflow.status: pending` et aucun desk destinataire.
+  Seuls les membres de `cord_intel` peuvent la consulter, la modifier ou la supprimer.
+- Le bouton **Valider et distribuer** permet de sélectionner plusieurs desks.
+  Le catalogue contient les desks ayant au moins un analyste ou conseiller actif.
+- Après validation, les analystes et conseillers des desks sélectionnés peuvent lire
+  l'observation et ses pièces jointes. `cord_intel` conserve l'accès pour le suivi.
+  Le rôle administrateur ne donne pas d'exception : il faut aussi appartenir à `cord_intel`.
+- Une modification du contenu annule la distribution et remet l'information en attente.
+  Une nouvelle validation est nécessaire. La redistribution remplace les anciens destinataires.
+- Les observations anciennes sans champ `workflow` restent en attente, sans migration de contenu.
+  Les droits utilisent le profil actuel du compte à chaque requête ; une désactivation ou
+  un changement de desk s'applique sans attendre l'expiration du jeton.
+
+Appliquer le mapping additif avant de démarrer la nouvelle version du backend :
+
+```bash
+node scripts/observation-workflow-mapping.cjs
+```
+
+Le script utilise le `.env` local, vérifie le mapping et peut être relancé. Il ne modifie
+aucun document existant. Le champ `workflow` contient `status`, `target_desks`,
+`submitted_at`, `validated_at` et `validated_by`.
+
+API authentifiée : `GET /api/observations/desks`, `POST /api/observations/search`
+(filtre facultatif `status: pending|validated`) et
+`PUT /api/observations/:id/validation`. Pour valider via Postman, lire d'abord
+`GET /api/observations/:id`, puis envoyer les versions retournées :
+
+```json
+{
+  "target_desks": ["desk_est", "desk_ouest"],
+  "_seq_no": 4,
+  "_primary_term": 1
+}
+```
+
+Le serveur refuse une validation d'une version périmée avec HTTP 409.
+Les champs de workflow envoyés à la création ou à la modification ne permettent
+pas de contourner la validation. Les identifiants envoyés lors de la création sont ignorés.
+Les fichiers d'évidence se consultent par `/api/evidence/:id` et `/file` avec
+`context=observations&recordId=...`, selon les mêmes droits que l'information.
+Les endpoints génériques de documents n'exposent pas ces évidences.
+
+Vérifications ciblées :
+
+```bash
+node node_modules/jest/bin/jest.js src/elasticsearch/observation-workflow.spec.ts src/elasticsearch/observation-workflow-http.spec.ts src/elasticsearch/evidence.spec.ts src/auth/ccoc-access.spec.ts --runInBand
 ```
 
 ## Compile and run the project

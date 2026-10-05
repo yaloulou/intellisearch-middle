@@ -1,7 +1,11 @@
 import { HttpException, HttpStatus, Injectable } from '@nestjs/common';
 import { createHash, randomBytes } from 'node:crypto';
-import { mkdir, writeFile } from 'node:fs/promises';
-import { extname, posix, resolve } from 'node:path';
+import { mkdir, writeFile, unlink } from 'node:fs/promises';
+import { extname, posix, resolve, relative, isAbsolute } from 'node:path';
+import { describeEvidenceFile, normalizeEvidence } from './evidence';
+import type { EvidenceFile, EvidenceRef } from './evidence';
+import { assertObservationReviewer, assertObservationVisible, isObservationReviewer, normalizeDesk, observationVisibility } from './observation-workflow';
+import type { ObservationWorkflow } from './observation-workflow';
 import { appConfig } from '../config/app.config';
 import { Role } from '../common/constants/roles.constant';
 import type { JwtPayload } from '../common/interfaces/jwt-payload.interface';
@@ -9,6 +13,8 @@ import type { JwtPayload } from '../common/interfaces/jwt-payload.interface';
 type UnknownRecord = Record<string, unknown>;
 
 interface ElasticsearchHit<TSource> {
+  _seq_no?: number;
+  _primary_term?: number;
   _id: string;
   _source: TSource;
 }
@@ -23,6 +29,8 @@ interface ElasticsearchSearchResponse<TSource> {
 }
 
 interface ElasticsearchDocumentResponse<TSource> {
+  _seq_no?: number;
+  _primary_term?: number;
   _id: string;
   _source?: TSource;
   result?: string;
@@ -239,6 +247,7 @@ export interface IntelDashboardInput {
 }
 
 export interface SearchObservationsInput {
+  status?: 'pending' | 'validated';
   search?: string;
   obs_type?: string;
   source_reliability?: string;
@@ -265,6 +274,7 @@ export interface SearchDocumentsInput {
 }
 
 interface EventDocument {
+  evidence?: EvidenceRef[];
   title: string;
   description: string;
   event_type: string;
@@ -319,6 +329,7 @@ interface EventDocument {
 }
 
 interface DocumentDocument {
+  owner_id?: string;
   title?: string;
   doc_type?: string;
   origin?: {
@@ -347,6 +358,7 @@ interface DocumentDocument {
 }
 
 interface ObservationDocument {
+  workflow?: ObservationWorkflow;
   obs_type: string;
   summary: string;
   entity_refs: Array<{ entity_id: string; role: string }>;
@@ -607,6 +619,122 @@ export class ElasticsearchService {
       },
       document: savedDocument.item,
     };
+  }
+
+  async uploadEvidence(file: EvidenceFile, context: string, classificationValue: string | undefined, user: JwtPayload) {
+    const allowed = context === 'observations'
+      ? [Role.OFFICIER, Role.COORDINATEUR, Role.ADMIN]
+      : context === 'events'
+        ? [Role.ANALYSTE, Role.CONSEILLER, Role.COORDINATEUR, Role.ADMIN]
+        : [];
+    if (!allowed.includes(user.role) && !(context === 'observations' && isObservationReviewer(user))) {
+      throw new HttpException('Accès refusé pour cet envoi de pièce jointe', HttpStatus.FORBIDDEN);
+    }
+    const { extension, type, mime } = describeEvidenceFile(file);
+    let classification: UnknownRecord = { level: 'OUVERT', compartments: [] };
+    if (classificationValue) {
+      try {
+        const parsed: unknown = JSON.parse(classificationValue);
+        if (!isRecord(parsed) || Array.isArray(parsed)) throw new Error('invalid');
+        classification = parsed;
+      } catch {
+        throw new HttpException('Classification invalide', HttpStatus.BAD_REQUEST);
+      }
+    }
+    const root = resolve(appConfig.uploads.evidenceDir);
+    const publicRoot = resolve(appConfig.uploads.dir);
+    const fromPublic = relative(publicRoot, root);
+    if (!fromPublic || (!fromPublic.startsWith('..') && !isAbsolute(fromPublic))) {
+      throw new HttpException('Le stockage des évidences doit être hors du dossier public uploads', HttpStatus.INTERNAL_SERVER_ERROR);
+    }
+    const docId = this.generateDocId();
+    const filename = `${randomBytes(24).toString('hex')}${extension}`;
+    const absolutePath = resolve(root, filename);
+    const sha256 = createHash('sha256').update(file.buffer).digest('hex');
+    const now = new Date().toISOString();
+    await mkdir(root, { recursive: true });
+    await writeFile(absolutePath, file.buffer, { flag: 'wx' });
+    try {
+      const saved = await this.saveDocument({
+        title: file.originalname.replace(/^.*[\\/]/, ''),
+        doc_type: `evidence_${type}`,
+        owner_id: user.sub,
+        origin: { source_type: 'upload', source_name: user.email },
+        file: { sha256, mime, path: filename, url: `/api/evidence/${encodeURIComponent(docId)}/file` },
+        classification,
+        tags: ['evidence', context],
+        audit: { created_at: now, updated_at: now, created_by: user.sub, updated_by: user.sub },
+      }, docId);
+      return { evidence: { doc_id: docId, type, sha256 }, document: saved.item };
+    } catch (error) {
+      await unlink(absolutePath).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  async getEvidenceById(id: string, user: JwtPayload, context?: string, recordId?: string) {
+    const document = await this.getDocumentById(id);
+    const parentQuery = { nested: { path: 'evidence', query: { term: { 'evidence.doc_id': id } } } };
+    const attached = await this.requestToElasticsearch<ElasticsearchSearchResponse<ObservationDocument>>(
+      `/${this.observationsIndex}/_search`, 'POST', { size: 1, _source: false, query: parentQuery });
+    if ((attached.hits?.total?.value ?? attached.hits?.hits?.length ?? 0) > 0) {
+      const visible = await this.requestToElasticsearch<ElasticsearchSearchResponse<ObservationDocument>>(
+        `/${this.observationsIndex}/_search`, 'POST', { size: 1, _source: false,
+          query: { bool: { filter: [parentQuery, observationVisibility(user)] } } });
+      if (!(visible.hits?.hits?.length)) throw new HttpException('Accès refusé à cette pièce jointe', HttpStatus.FORBIDDEN);
+      // Parent context must be explicit to prevent reuse through a generic upload request.
+      if (context !== 'observations' || !recordId) throw new HttpException('Indiquez l’information associée', HttpStatus.FORBIDDEN);
+      const parent = await this.getObservationById(recordId, user);
+      if (parent.evidence?.some(ref => ref.doc_id === id)) return document;
+      throw new HttpException('Pièce jointe absente de cette information', HttpStatus.FORBIDDEN);
+    }
+    if (document.owner_id === user.sub) {
+      if (context === 'observations' && recordId) await this.getObservationById(recordId, user);
+      return document;
+    }
+    // Access to an existing attachment follows access to its parent record.
+    // Unattached files can only be consulted by their uploader.
+    if (recordId && (context === 'observations' || context === 'events')) {
+      if (context === 'events' && user.role === Role.OFFICIER) {
+        throw new HttpException('Accès refusé', HttpStatus.FORBIDDEN);
+      }
+      const record = context === 'observations'
+        ? await this.getObservationById(recordId, user)
+        : await this.getEventById(recordId, user);
+      if (record.evidence?.some((ref) => ref.doc_id === id)) return document;
+    }
+    throw new HttpException('Accès refusé à cette pièce jointe', HttpStatus.FORBIDDEN);
+  }
+
+  async getEvidenceFile(id: string, user: JwtPayload, context?: string, recordId?: string) {
+    const document = await this.getEvidenceById(id, user, context, recordId);
+    const root = resolve(document.doc_type?.startsWith('evidence_')
+      ? appConfig.uploads.evidenceDir : appConfig.uploads.dir);
+    const path = resolve(root, document.file?.path ?? '');
+    const withinRoot = relative(root, path);
+    if (!withinRoot || withinRoot.startsWith('..') || isAbsolute(withinRoot)) {
+      throw new HttpException('Chemin de pièce jointe invalide', HttpStatus.BAD_REQUEST);
+    }
+    return { path, mime: document.file?.mime ?? 'application/octet-stream', title: document.title ?? id };
+  }
+
+  private async prepareEvidence(refs: EvidenceRef[] | undefined, documentId: string | undefined, context: 'observations' | 'events', user?: JwtPayload) {
+    if (refs === undefined && documentId) {
+      const existing = context === 'observations'
+        ? await this.getObservationById(documentId, user)
+        : await this.getEventById(documentId, user);
+      return existing.evidence;
+    }
+    if (user && refs) {
+      for (const ref of refs) {
+        const document = await this.getEvidenceById(ref.doc_id, user, context, documentId);
+        if (document.doc_type?.startsWith('evidence_')) {
+          ref.type = document.doc_type.slice('evidence_'.length);
+          ref.sha256 = document.file?.sha256;
+        }
+      }
+    }
+    return refs;
   }
 
   async searchLinks(input: SearchLinksInput, user?: JwtPayload) {
@@ -1075,10 +1203,9 @@ export class ElasticsearchService {
       filters.push({ range: { 'time.observed_at': dateRange } });
     }
 
-    // ── Permission-level data filtering ─────────────────────────────
-    if (user?.role === Role.OFFICIER) {
-      filters.push({ term: { owner_id: user.sub } });
-    }
+    filters.push(observationVisibility(user));
+    if (input.status === 'validated') filters.push({ term: { 'workflow.status': 'validated' } });
+    if (input.status === 'pending') filters.push({ bool: { must_not: [{ term: { 'workflow.status': 'validated' } }] } });
 
     const hasConstraints = must.length > 0 || filters.length > 0;
 
@@ -1093,6 +1220,7 @@ export class ElasticsearchService {
         : { match_all: {} },
       sort: [{ 'time.observed_at': { order: 'desc' } }],
       size,
+      seq_no_primary_term: true,
     };
 
     const response = await this.requestToElasticsearch<ElasticsearchSearchResponse<ObservationDocument>>(
@@ -1108,6 +1236,8 @@ export class ElasticsearchService {
       items: hits.map((hit) => ({
         ...(hit._source ?? {}),
         _id: hit._id,
+        _seq_no: hit._seq_no,
+        _primary_term: hit._primary_term,
       })),
     };
   }
@@ -1124,65 +1254,86 @@ export class ElasticsearchService {
       throw new HttpException('Observation introuvable', HttpStatus.NOT_FOUND);
     }
 
-    if (user?.role === Role.OFFICIER && response._source?.owner_id !== user.sub) {
-      throw new HttpException('Accès refusé', HttpStatus.FORBIDDEN);
-    }
+    assertObservationVisible(response._source?.workflow, user);
 
     return {
       ...(response._source ?? {}),
       _id: response._id,
+      _seq_no: response._seq_no,
+      _primary_term: response._primary_term,
     };
+  }
+
+  async listObservationDesks(user?: JwtPayload) {
+    assertObservationReviewer(user);
+    const response = await this.requestToElasticsearch<ElasticsearchAggregationResponse>(
+      `/${appConfig.elasticsearch.indexes.users}/_search`, 'POST', {
+        size: 0,
+        query: { bool: { filter: [{ term: { actif: true } }, { terms: { role: [Role.ANALYSTE, Role.CONSEILLER] } }] } },
+        aggs: { desks: { terms: { field: 'desk', size: 1000 } } },
+      });
+    return { items: [...new Set((response.aggregations?.desks?.buckets ?? []).map(b => normalizeDesk(b.key)).filter(d => d && d !== 'cord_intel'))].sort() };
+  }
+
+  async validateObservation(id: string, payload: UnknownRecord, user?: JwtPayload) {
+    assertObservationReviewer(user);
+    const existing = await this.getObservationById(id, user);
+    const targets = Array.isArray(payload.target_desks) ? [...new Set(payload.target_desks.map(normalizeDesk))] : [];
+    const available = (await this.listObservationDesks(user)).items;
+    if (!targets.length || targets.some(d => !d || !available.includes(d))) {
+      throw new HttpException('Choisissez au moins un desk avec un analyste ou conseiller actif', HttpStatus.BAD_REQUEST);
+    }
+    if (!Number.isInteger(payload._seq_no) || !Number.isInteger(payload._primary_term) ||
+        payload._seq_no !== existing._seq_no || payload._primary_term !== existing._primary_term) {
+      throw new HttpException('Cette information a changé. Rechargez-la avant de la valider.', HttpStatus.CONFLICT);
+    }
+    const now = new Date().toISOString();
+    const workflow: ObservationWorkflow = { status: 'validated', target_desks: targets,
+      submitted_at: existing.workflow?.submitted_at ?? existing.audit?.created_at ?? now,
+      validated_at: now, validated_by: user!.sub };
+    await this.requestToElasticsearch(
+      `/${this.observationsIndex}/_update/${encodeURIComponent(id)}?if_seq_no=${existing._seq_no}&if_primary_term=${existing._primary_term}&refresh=wait_for`,
+      'POST', { doc: { workflow, audit: { ...existing.audit, updated_at: now, updated_by: user!.sub } } });
+    return this.getObservationById(id, user);
   }
 
   async saveObservation(payload: UnknownRecord, documentId?: string, user?: JwtPayload) {
-    const normalizedPayload = this.buildObservationPayload(payload);
+    if (!user) throw new HttpException('Authentification requise', HttpStatus.UNAUTHORIZED);
     const explicitId = this.normalizeString(documentId);
-    const payloadId = this.normalizeString((payload._id as string | undefined) ?? undefined);
-    const obsId = explicitId ?? payloadId ?? this.generateObsId();
+    let existing: Awaited<ReturnType<ElasticsearchService['getObservationById']>> | undefined;
+    if (explicitId) {
+      assertObservationReviewer(user);
+      existing = await this.getObservationById(explicitId, user);
+      if (payload._seq_no !== undefined && (payload._seq_no !== existing._seq_no || payload._primary_term !== existing._primary_term)) {
+        throw new HttpException('Cette information a changé. Rechargez-la avant de la modifier.', HttpStatus.CONFLICT);
+      }
+    } else if (![Role.OFFICIER, Role.COORDINATEUR, Role.ADMIN].includes(user.role) && !isObservationReviewer(user)) {
+      throw new HttpException('Accès refusé', HttpStatus.FORBIDDEN);
+    }
+    const normalizedPayload = this.buildObservationPayload(payload);
+    normalizedPayload.evidence = await this.prepareEvidence(normalizedPayload.evidence, explicitId, 'observations', user);
+    const obsId = explicitId ?? this.generateObsId();
     const now = new Date().toISOString();
-
-    const docToSave: UnknownRecord = {
-      ...normalizedPayload,
-      ...(user ? {
-        owner_id: user.sub,
-        audit: {
-          ...(normalizedPayload.audit ?? {}),
-          ...(!explicitId ? { created_at: now, created_by: user.sub } : {}),
-          updated_at: now,
-          updated_by: user.sub,
-        },
-      } : {}),
-    };
-
+    const docToSave = { ...normalizedPayload, owner_id: existing?.owner_id ?? user.sub,
+      workflow: { status: 'pending', target_desks: [], submitted_at: now } as ObservationWorkflow,
+      audit: { created_at: existing?.audit?.created_at ?? now, created_by: existing?.audit?.created_by ?? user.sub,
+        updated_at: now, updated_by: user.sub } };
+    const concurrency = existing?._seq_no !== undefined
+      ? `&if_seq_no=${existing._seq_no}&if_primary_term=${existing._primary_term}` : '';
     const response = await this.requestToElasticsearch<ElasticsearchDocumentResponse<ObservationDocument>>(
-      `/${this.observationsIndex}/_doc/${encodeURIComponent(obsId)}`,
-      'POST',
-      docToSave,
-    );
-
-    return {
-      _id: response._id ?? obsId,
-      id: response._id ?? obsId,
-      result: response.result ?? 'updated',
-      item: {
-        ...docToSave,
-        _id: response._id ?? obsId,
-      },
-    };
+      `/${this.observationsIndex}/${explicitId ? '_doc' : '_create'}/${encodeURIComponent(obsId)}?refresh=wait_for${concurrency}`,
+      'POST', docToSave);
+    return { _id: response._id ?? obsId, id: response._id ?? obsId, result: response.result ?? 'updated',
+      item: { ...docToSave, _id: response._id ?? obsId } };
   }
 
-  async deleteObservation(id: string) {
-    const obsId = this.normalizeRequired(id, 'id');
-
+  async deleteObservation(id: string, user?: JwtPayload) {
+    assertObservationReviewer(user);
+    const existing = await this.getObservationById(id, user);
+    const concurrency = existing._seq_no !== undefined ? `&if_seq_no=${existing._seq_no}&if_primary_term=${existing._primary_term}` : '';
     const response = await this.requestToElasticsearch<ElasticsearchDocumentResponse<unknown>>(
-      `/${this.observationsIndex}/_doc/${encodeURIComponent(obsId)}`,
-      'DELETE',
-    );
-
-    return {
-      id: response._id ?? obsId,
-      result: response.result ?? 'deleted',
-    };
+      `/${this.observationsIndex}/_doc/${encodeURIComponent(id)}?refresh=wait_for${concurrency}`, 'DELETE');
+    return { id: response._id ?? id, result: response.result ?? 'deleted' };
   }
 
   // ── Events (events_v1) ─────────────────────────────────────────────
@@ -1294,6 +1445,7 @@ export class ElasticsearchService {
     const normalizedPayload = this.buildEventPayload(payload);
     const explicitId = this.normalizeString(documentId);
     const payloadId = this.normalizeString((payload._id as string | undefined) ?? undefined);
+    normalizedPayload.evidence = await this.prepareEvidence(normalizedPayload.evidence, explicitId ?? payloadId, 'events', user);
     const eventId = explicitId ?? payloadId ?? this.generateEventId();
     const now = new Date().toISOString();
 
@@ -1728,6 +1880,7 @@ export class ElasticsearchService {
       : [];
 
     const normalized: EventDocument = {
+      evidence: normalizeEvidence(payload.evidence),
       title: this.normalizeString((payload.title as string | undefined) ?? undefined) ?? '',
       description: this.normalizeString((payload.description as string | undefined) ?? undefined) ?? '',
       event_type: this.normalizeString((payload.event_type as string | undefined) ?? undefined) ?? '',
@@ -1809,13 +1962,7 @@ export class ElasticsearchService {
         }))
       : [];
 
-    const evidence = Array.isArray(payload.evidence)
-      ? (payload.evidence as UnknownRecord[]).filter(isRecord).map((e) => ({
-          doc_id: this.normalizeString(e.doc_id as string | undefined) ?? '',
-          type: this.normalizeString(e.type as string | undefined),
-          sha256: this.normalizeString(e.sha256 as string | undefined),
-        }))
-      : undefined;
+    const evidence = normalizeEvidence(payload.evidence);
 
     const normalized: ObservationDocument = {
       obs_type: this.normalizeString((payload.obs_type as string | undefined) ?? undefined) ?? '',
@@ -1879,7 +2026,7 @@ export class ElasticsearchService {
     const size = this.resolveSize(input.size, 100, 1000);
 
     const must: UnknownRecord[] = [];
-    const filters: UnknownRecord[] = [];
+    const filters: UnknownRecord[] = [{ bool: { must_not: [{ prefix: { doc_type: 'evidence_' } }, { term: { tags: 'observations' } }] } }];
 
     if (search) {
       must.push({
@@ -1925,6 +2072,26 @@ export class ElasticsearchService {
       count: response.hits?.total?.value ?? hits.length,
       items: hits.map((hit) => ({ ...(hit._source ?? {}), _id: hit._id })),
     };
+  }
+
+  async getPublicDocument(id: string) {
+    const document = await this.getDocumentById(id);
+    if (document.doc_type?.startsWith('evidence_') || document.tags?.includes('observations')) {
+      throw new HttpException('Utilisez l’accès aux pièces jointes de l’information', HttpStatus.FORBIDDEN);
+    }
+    return document;
+  }
+
+  async savePublicDocument(payload: UnknownRecord, id?: string) {
+    const targetId = id ?? this.normalizeString(payload._id as string);
+    if (targetId) await this.getPublicDocument(targetId);
+    if (String(payload.doc_type ?? '').startsWith('evidence_')) throw new HttpException('Utilisez le dépôt de pièces jointes', HttpStatus.FORBIDDEN);
+    return this.saveDocument(payload, id);
+  }
+
+  async deletePublicDocument(id: string) {
+    await this.getPublicDocument(id);
+    return this.deleteDocument(id);
   }
 
   async getDocumentById(id: string) {
@@ -2108,6 +2275,7 @@ export class ElasticsearchService {
     const audit = isRecord(payload.audit) ? payload.audit : {};
 
     return {
+      owner_id: this.normalizeString(payload.owner_id as string | undefined),
       title: this.normalizeString((payload.title as string | undefined) ?? undefined),
       doc_type: this.normalizeString((payload.doc_type as string | undefined) ?? undefined),
       origin: {

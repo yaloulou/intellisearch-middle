@@ -19,5 +19,6 @@ export const appConfig = {
   uploads: {
     dir: process.env.UPLOADS_DIR ?? 'uploads',
     publicPath: process.env.UPLOADS_PUBLIC_PATH ?? '/uploads',
+    evidenceDir: process.env.EVIDENCE_UPLOADS_DIR ?? 'evidence-uploads',
   },
 } as const;
