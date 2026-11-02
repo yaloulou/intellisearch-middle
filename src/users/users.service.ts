@@ -1,4 +1,4 @@
-import { ConflictException, HttpException, HttpStatus, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, HttpException, HttpStatus, Injectable, NotFoundException } from '@nestjs/common';
 import * as bcrypt from 'bcrypt';
 import { appConfig } from '../config/app.config';
 import type { Role } from '../common/constants/roles.constant';
@@ -87,6 +87,7 @@ export class UsersService {
     role: Role;
     desk?: string;
   }): Promise<SafeUser> {
+    const desk = this.normalizeUserDesk(data.desk);
     const existing = await this.findByEmailWithHash(data.email);
     if (existing) {
       throw new ConflictException('Un compte avec cet email existe déjà');
@@ -100,13 +101,13 @@ export class UsersService {
       nom: data.nom,
       prenom: data.prenom,
       role: data.role,
-      desk: data.desk,
+      desk,
       actif: true,
       created_at: now,
       updated_at: now,
     };
 
-    const res = await this.esRequest<EsDocResponse>(`/${this.usersIndex}/_doc`, 'POST', doc);
+    const res = await this.esRequest<EsDocResponse>(`/${this.usersIndex}/_doc?refresh=wait_for`, 'POST', doc);
     const { password_hash: _, ...safe } = { _id: res._id, ...doc };
     return safe as SafeUser;
   }
@@ -118,9 +119,11 @@ export class UsersService {
     const existing = await this.findById(id);
     if (!existing) throw new NotFoundException('Utilisateur introuvable');
 
-    const update = { ...data, updated_at: new Date().toISOString() };
+    const update = { ...data,
+      ...(Object.prototype.hasOwnProperty.call(data, 'desk') ? { desk: this.normalizeUserDesk(data.desk) ?? '' } : {}),
+      updated_at: new Date().toISOString() };
     await this.esRequest<EsDocResponse>(
-      `/${this.usersIndex}/_update/${encodeURIComponent(id)}`,
+      `/${this.usersIndex}/_update/${encodeURIComponent(id)}?refresh=wait_for`,
       'POST',
       { doc: update },
     );
@@ -145,7 +148,7 @@ export class UsersService {
     if (!existing) throw new NotFoundException('Utilisateur introuvable');
 
     await this.esRequest<EsDocResponse>(
-      `/${this.usersIndex}/_update/${encodeURIComponent(id)}`,
+      `/${this.usersIndex}/_update/${encodeURIComponent(id)}?refresh=wait_for`,
       'POST',
       { doc: { actif: false, updated_at: new Date().toISOString() } },
     );
@@ -153,6 +156,13 @@ export class UsersService {
   }
 
   // ── Private helpers ───────────────────────────────────────────────────────
+
+  private normalizeUserDesk(value: unknown): string | undefined {
+    if (value === undefined) return undefined;
+    if (value === null) return '';
+    if (typeof value !== 'string') throw new BadRequestException('Le desk doit être un nom saisi en texte');
+    return value.trim();
+  }
 
   private async esRequest<T>(path: string, method: string, body?: unknown): Promise<T> {
     const headers: Record<string, string> = { Accept: 'application/json' };

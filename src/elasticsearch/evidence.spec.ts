@@ -116,6 +116,36 @@ describe('Evidence uploads and record persistence', () => {
     await expect(service.getEvidenceFile(upload.evidence.doc_id, uploader)).rejects.toThrow('Chemin');
   });
 
+  it('allows an officer author to read their pending observation media over HTTP and denies another officer', async () => {
+    const author = { ...uploader, sub: 'author', role: Role.OFFICIER, desk: 'terrain' };
+    const module = await Test.createTestingModule({ imports: [AppModule] })
+      .overrideProvider(UsersService).useValue({ findById: async (id: string) => ({ ...author, sub: id, _id: id, actif: true }) })
+      .overrideProvider(ElasticsearchService).useValue(service).compile();
+    const app = module.createNestApplication({ logger: false });
+    await app.init();
+    try {
+      const token = module.get(JwtService).sign(author);
+      const other = module.get(JwtService).sign({ ...author, sub: 'another-officer' });
+      const server = app.getHttpServer();
+      const uploaded = await requestHttp(server).post('/api/uploads/evidence')
+        .set('Authorization', `Bearer ${token}`).field('context', 'observations')
+        .attach('file', Buffer.from('sample file'), 'report.pdf').expect(201);
+      const { evidence } = uploaded.body;
+      const saved = await requestHttp(server).post('/api/observations').set('Authorization', `Bearer ${token}`)
+        .send({ obs_type: 'autre', summary: 'Information en attente', evidence: [evidence] }).expect(201);
+      const context = { context: 'observations', recordId: saved.body.id };
+      await requestHttp(server).get(`/api/evidence/${evidence.doc_id}`).query(context)
+        .set('Authorization', `Bearer ${token}`).expect(200);
+      await requestHttp(server).get(`/api/evidence/${evidence.doc_id}/file`).query(context)
+        .set('Authorization', `Bearer ${token}`).set('Range', 'bytes=0-3').expect(206)
+        .expect('Content-Range', 'bytes 0-3/11');
+      await requestHttp(server).get(`/api/evidence/${evidence.doc_id}`).query(context)
+        .set('Authorization', `Bearer ${other}`).expect(403);
+      await requestHttp(server).get(`/api/evidence/${evidence.doc_id}/file`).query(context)
+        .set('Authorization', `Bearer ${other}`).expect(403);
+    } finally { await app.close(); }
+  });
+
   it('serves authenticated multipart uploads and file ranges through the real controller', async () => {
     const module = await Test.createTestingModule({ imports: [AppModule] })
       .overrideProvider(UsersService).useValue({ findById: async () => ({ _id: uploader.sub, ...uploader, actif: true }) })

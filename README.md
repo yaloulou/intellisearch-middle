@@ -54,6 +54,36 @@ Après connexion, les autres comptes arrivent sur Informations.
 Validation : `node node_modules/jest/bin/jest.js src/auth/ccoc-access.spec.ts --runInBand`
 dans le backend et `node --test scripts/test-ccoc-access.cjs` dans le frontend.
 
+### Recherche CCOC dans la description
+
+`POST /api/intel/search` utilise le champ `search` comme du texte ordinaire :
+aucune syntaxe spéciale n'est nécessaire. La recherche porte uniquement sur
+`event.description` et exige tous les termes retenus par l'analyseur français
+du champ. Les mots de liaison sont ignorés selon cet analyseur, certaines
+variantes linguistiques sont conservées et la recherche approximative est
+désactivée pour tous les termes, sans liste de sigles à configurer.
+
+Avec une recherche, les résultats sont classés par pertinence (bonus aux
+expressions et aux mots proches), puis par date décroissante. Sans recherche,
+le tri reste chronologique. Les filtres existants et les droits d'accès restent
+appliqués. Aucun changement de mapping ou réindexation n'est nécessaire.
+
+Chaque résultat d'une recherche peut contenir `search_highlights`, un tableau
+d'extraits de la description, dont le texte est échappé en HTML et les termes
+entourés de `<mark>`. Le frontend React affiche ces extraits comme du texte
+avec surlignage, sans injection HTML. La description originale est conservée.
+
+Test d'intégration facultatif sur Elasticsearch (PowerShell, depuis le backend) :
+
+```powershell
+$env:CCOC_SEARCH_INTEGRATION = '1'
+$env:DOTENV_CONFIG_QUIET = 'true'
+node node_modules/jest/bin/jest.js src/elasticsearch/ccoc-search.integration.spec.ts --runInBand
+```
+
+Ce test crée puis supprime un index temporaire unique avec des données fictives
+et l'analyseur de l'index CCOC configuré. Il ne modifie pas les index applicatifs.
+
 ### Pièces jointes des informations et renseignements
 
 Les formulaires Informations (`observations_v1`) et Renseignements (`events_v1`)
@@ -207,15 +237,25 @@ Le desk `cord_intel` contrôle les observations. Il se sélectionne dans la gest
 des comptes ; les comptes existants ne sont pas réaffectés automatiquement.
 
 - Une nouvelle observation reçoit `workflow.status: pending` et aucun desk destinataire.
-  Seuls les membres de `cord_intel` peuvent la consulter, la modifier ou la supprimer.
+  Son auteur peut la consulter dès l'enregistrement, avec ses pièces jointes.
+  Les membres de `cord_intel` peuvent la consulter, la modifier, la valider ou la supprimer.
+  L'auteur conserve son accès en lecture après validation, redistribution ou changement
+  de desk. L'autorisation de lecture ne lui donne pas le droit de modifier ou de valider.
+  L'auteur est identifié par `owner_id`, avec repli sur `audit.created_by` uniquement
+  pour les anciens documents sans `owner_id`.
 - Le bouton **Valider et distribuer** permet de sélectionner plusieurs desks.
-  Le catalogue contient les desks ayant au moins un analyste ou conseiller actif.
+  Le catalogue affiche tous les desks affectés à des comptes, sauf `cord_intel`.
+  Les desks sans analyste ou conseiller actif sont affichés comme indisponibles ;
+  ils deviennent sélectionnables dès qu'un destinataire autorisé leur est affecté.
+  Les créations et changements d'affectation des comptes attendent le rafraîchissement
+  Elasticsearch avant de confirmer l'enregistrement.
 - Après validation, les analystes et conseillers des desks sélectionnés peuvent lire
-  l'observation et ses pièces jointes. `cord_intel` conserve l'accès pour le suivi.
-  Le rôle administrateur ne donne pas d'exception : il faut aussi appartenir à `cord_intel`.
+  l'observation et ses pièces jointes. L'auteur et `cord_intel` conservent leur accès.
+  Le rôle administrateur ne donne pas d'accès général aux observations des autres auteurs.
 - Une modification du contenu annule la distribution et remet l'information en attente.
   Une nouvelle validation est nécessaire. La redistribution remplace les anciens destinataires.
-- Les observations anciennes sans champ `workflow` restent en attente, sans migration de contenu.
+- Les observations anciennes sans champ `workflow` restent en attente, accessibles à leur
+  auteur identifié et à `cord_intel`, sans migration de contenu.
   Les droits utilisent le profil actuel du compte à chaque requête ; une désactivation ou
   un changement de desk s'applique sans attendre l'expiration du jeton.
 
@@ -229,7 +269,8 @@ Le script utilise le `.env` local, vérifie le mapping et peut être relancé. I
 aucun document existant. Le champ `workflow` contient `status`, `target_desks`,
 `submitted_at`, `validated_at` et `validated_by`.
 
-API authentifiée : `GET /api/observations/desks`, `POST /api/observations/search`
+API authentifiée : `GET /api/observations/desks` renvoie `items` (tous les desks)
+et `eligible_desks` (les desks sélectionnables). `POST /api/observations/search`
 (filtre facultatif `status: pending|validated`) et
 `PUT /api/observations/:id/validation`. Pour valider via Postman, lire d'abord
 `GET /api/observations/:id`, puis envoyer les versions retournées :

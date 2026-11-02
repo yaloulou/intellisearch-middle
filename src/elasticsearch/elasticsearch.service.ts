@@ -17,6 +17,7 @@ interface ElasticsearchHit<TSource> {
   _primary_term?: number;
   _id: string;
   _source: TSource;
+  highlight?: Record<string, string[]>;
 }
 
 interface ElasticsearchSearchResponse<TSource> {
@@ -40,6 +41,7 @@ interface ElasticsearchDocumentResponse<TSource> {
 interface ElasticsearchAggBucket {
   key: string;
   doc_count: number;
+  eligible?: { doc_count?: number };
 }
 
 interface ElasticsearchAggregationResponse {
@@ -886,20 +888,26 @@ export class ElasticsearchService {
 
     if (search) {
       must.push({
-        multi_match: {
-          query: search,
-          fields: [
-            'event.description^3',
-            'event.event_type^2',
-            'actors.nom^2',
-            'actors.assoc',
-            'event.categorie',
-            'source.source_name',
-            'location.province_region',
-            'location.territoire_ville',
-            'location.localite_village_lieuprecis',
+        bool: {
+          // Use the field's French analyzer, but never expand to similar words.
+          // Plain text is not parsed as query syntax: users need no operators.
+          must: [{
+            match: {
+              'event.description': {
+                query: search,
+                operator: 'and',
+                fuzziness: 0,
+                zero_terms_query: 'none',
+              },
+            },
+          }],
+          // These optional clauses improve ranking without dropping descriptions
+          // where the required words appear farther apart or in another order.
+          should: [
+            { match_phrase: { 'event.description': { query: search, slop: 0, boost: 6 } } },
+            { match_phrase: { 'event.description': { query: search, slop: 8, boost: 2 } } },
           ],
-          fuzziness: 'AUTO',
+          minimum_should_match: 0,
         },
       });
     }
@@ -945,7 +953,26 @@ export class ElasticsearchService {
             },
           }
         : { match_all: {} },
-      sort: [{ 'event.date_event': { order: 'desc' } }],
+      sort: [
+        ...(search ? [{ _score: { order: 'desc' } }] : []),
+        { 'event.date_event': { order: 'desc' } },
+      ],
+      ...(search ? {
+        highlight: {
+          encoder: 'html',
+          pre_tags: ['<mark>'],
+          post_tags: ['</mark>'],
+          fields: {
+            'event.description': {
+              type: 'unified',
+              fragment_size: 220,
+              number_of_fragments: 2,
+              order: 'score',
+              boundary_scanner_locale: 'fr',
+            },
+          },
+        },
+      } : {}),
       size,
     };
 
@@ -962,6 +989,7 @@ export class ElasticsearchService {
       items: hits.map((hit) => ({
         ...(hit._source ?? {}),
         _id: hit._id,
+        ...(search ? { search_highlights: hit.highlight?.['event.description'] ?? [] } : {}),
       })),
     };
   }
@@ -1254,7 +1282,7 @@ export class ElasticsearchService {
       throw new HttpException('Observation introuvable', HttpStatus.NOT_FOUND);
     }
 
-    assertObservationVisible(response._source?.workflow, user);
+    assertObservationVisible(response._source, user);
 
     return {
       ...(response._source ?? {}),
@@ -1269,17 +1297,26 @@ export class ElasticsearchService {
     const response = await this.requestToElasticsearch<ElasticsearchAggregationResponse>(
       `/${appConfig.elasticsearch.indexes.users}/_search`, 'POST', {
         size: 0,
-        query: { bool: { filter: [{ term: { actif: true } }, { terms: { role: [Role.ANALYSTE, Role.CONSEILLER] } }] } },
-        aggs: { desks: { terms: { field: 'desk', size: 1000 } } },
+        aggs: { desks: { terms: { field: 'desk', size: 1000 }, aggs: {
+          eligible: { filter: { bool: { filter: [
+            { term: { actif: true } }, { terms: { role: [Role.ANALYSTE, Role.CONSEILLER] } },
+          ] } } },
+        } } },
       });
-    return { items: [...new Set((response.aggregations?.desks?.buckets ?? []).map(b => normalizeDesk(b.key)).filter(d => d && d !== 'cord_intel'))].sort() };
+    const desks = new Map<string, number>();
+    for (const bucket of response.aggregations?.desks?.buckets ?? []) {
+      const desk = normalizeDesk(bucket.key);
+      if (desk && desk !== 'cord_intel') desks.set(desk, (desks.get(desk) ?? 0) + (bucket.eligible?.doc_count ?? 0));
+    }
+    const items = [...desks.keys()].sort();
+    return { items, eligible_desks: items.filter(desk => desks.get(desk)! > 0) };
   }
 
   async validateObservation(id: string, payload: UnknownRecord, user?: JwtPayload) {
     assertObservationReviewer(user);
     const existing = await this.getObservationById(id, user);
     const targets = Array.isArray(payload.target_desks) ? [...new Set(payload.target_desks.map(normalizeDesk))] : [];
-    const available = (await this.listObservationDesks(user)).items;
+    const available = (await this.listObservationDesks(user)).eligible_desks;
     if (!targets.length || targets.some(d => !d || !available.includes(d))) {
       throw new HttpException('Choisissez au moins un desk avec un analyste ou conseiller actif', HttpStatus.BAD_REQUEST);
     }
@@ -1314,7 +1351,7 @@ export class ElasticsearchService {
     normalizedPayload.evidence = await this.prepareEvidence(normalizedPayload.evidence, explicitId, 'observations', user);
     const obsId = explicitId ?? this.generateObsId();
     const now = new Date().toISOString();
-    const docToSave = { ...normalizedPayload, owner_id: existing?.owner_id ?? user.sub,
+    const docToSave = { ...normalizedPayload, owner_id: existing?.owner_id ?? existing?.audit?.created_by ?? user.sub,
       workflow: { status: 'pending', target_desks: [], submitted_at: now } as ObservationWorkflow,
       audit: { created_at: existing?.audit?.created_at ?? now, created_by: existing?.audit?.created_by ?? user.sub,
         updated_at: now, updated_by: user.sub } };

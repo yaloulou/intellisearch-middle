@@ -41,8 +41,11 @@ describe('Observation workflow through authenticated HTTP routes', () => {
     const created = await request(server).post('/api/observations').set('Authorization', `Bearer ${token('creator')}`)
       .send({ obs_type: 'autre', summary: 'À valider', workflow: { status: 'validated', target_desks: ['desk_est'] } }).expect(201);
     const id = created.body.id;
+    await request(server).get(`/api/observations/${id}`).set('Authorization', `Bearer ${token('creator')}`).expect(200);
+    await request(server).post('/api/observations/search').set('Authorization', `Bearer ${token('creator')}`)
+      .send({ status: 'pending' }).expect(201).expect(res => expect(res.body.count).toBe(1));
     for (const account of ['creator', 'recipient', 'outsider', 'admin']) {
-      await request(server).get(`/api/observations/${id}`).set('Authorization', `Bearer ${token(account)}`).expect(403);
+      if (account !== 'creator') await request(server).get(`/api/observations/${id}`).set('Authorization', `Bearer ${token(account)}`).expect(403);
       await request(server).get('/api/observations/desks').set('Authorization', `Bearer ${token(account)}`).expect(403);
       await request(server).put(`/api/observations/${id}/validation`).set('Authorization', `Bearer ${token(account)}`)
         .send({ target_desks: ['desk_est'] }).expect(403);
@@ -52,7 +55,10 @@ describe('Observation workflow through authenticated HTTP routes', () => {
     await request(server).post('/api/observations/search').set('Authorization', `Bearer ${token('reviewer')}`)
       .send({ status: 'pending' }).expect(201).expect(res => expect(res.body.count).toBe(1));
     await request(server).get('/api/observations/desks').set('Authorization', `Bearer ${token('reviewer')}`)
-      .expect(200).expect(res => expect(res.body.items).toEqual(['desk_est', 'desk_ouest']));
+      .expect(200).expect(res => {
+        expect(res.body.items).toEqual(['desk_est', 'desk_ouest', 'terrain']);
+        expect(res.body.eligible_desks).toEqual(['desk_est', 'desk_ouest']);
+      });
     const detail = await request(server).get(`/api/observations/${id}`).set('Authorization', `Bearer ${token('reviewer')}`).expect(200);
     const validation = { target_desks: ['desk_est'], _seq_no: detail.body._seq_no, _primary_term: detail.body._primary_term };
     await request(server).put(`/api/observations/${id}/validation`).set('Authorization', `Bearer ${token('reviewer')}`)
@@ -60,12 +66,21 @@ describe('Observation workflow through authenticated HTTP routes', () => {
     await request(server).put(`/api/observations/${id}/validation`).set('Authorization', `Bearer ${token('reviewer')}`)
       .send(validation).expect(409);
     await request(server).get(`/api/observations/${id}`).set('Authorization', `Bearer ${token('recipient')}`).expect(200);
-    for (const account of ['outsider', 'creator', 'admin']) {
+    await request(server).get(`/api/observations/${id}`).set('Authorization', `Bearer ${token('creator')}`).expect(200);
+    for (const account of ['outsider', 'admin']) {
       await request(server).post('/api/observations/search').set('Authorization', `Bearer ${token(account)}`)
         .send({}).expect(201).expect(res => expect(res.body.count).toBe(0));
     }
     // Desk changes apply immediately, without waiting for JWT expiry.
     accounts.find(user => user._id === 'recipient')!.desk = 'desk_ouest';
     await request(server).get(`/api/observations/${id}`).set('Authorization', `Bearer ${token('recipient')}`).expect(403);
+    await request(server).put(`/api/observations/${id}`).set('Authorization', `Bearer ${token('reviewer')}`)
+      .send({ obs_type: 'autre', summary: 'Correction par cord_intel' }).expect(200);
+    await request(server).get(`/api/observations/${id}`).set('Authorization', `Bearer ${token('creator')}`)
+      .expect(200).expect(res => {
+        expect(res.body.summary).toBe('Correction par cord_intel');
+        expect(res.body.owner_id).toBe('creator');
+        expect(res.body.workflow.status).toBe('pending');
+      });
   });
 });

@@ -31,13 +31,15 @@ describe('Observation validation and desk distribution', () => {
     return service.validateObservation(id, { target_desks: targets, _seq_no: current._seq_no, _primary_term: current._primary_term }, reviewer);
   };
 
-  it('forces pending state and denies creator, admins and other desks both listing and direct access', async () => {
+  it('forces pending state and permits the author while denying unrelated users and admins', async () => {
     const created = await service.saveObservation({ ...payload, _id: 'forged-id', owner_id: 'forged',
       workflow: { status: 'validated', target_desks: ['desk_est'] } }, undefined, officer);
     expect(created.id).not.toBe('forged-id');
     expect(created.item.workflow).toMatchObject({ status: 'pending', target_desks: [] });
     expect(created.item.owner_id).toBe(officer.sub);
-    for (const account of [officer, analyst, adviser, user(Role.ADMIN), user(Role.COORDINATEUR, 'desk_est')]) {
+    expect((await service.searchObservations({}, officer)).count).toBe(1);
+    await expect(service.getObservationById(created.id, officer)).resolves.toHaveProperty('summary', payload.summary);
+    for (const account of [analyst, adviser, user(Role.ADMIN), user(Role.COORDINATEUR, 'desk_est')]) {
       expect((await service.searchObservations({}, account)).count).toBe(0);
       await expect(service.getObservationById(created.id, account)).rejects.toThrow('Accès refusé');
     }
@@ -52,12 +54,13 @@ describe('Observation validation and desk distribution', () => {
       expect((await service.getObservationById(created.id, account)).workflow?.target_desks).toEqual(['desk_est', 'desk_ouest']);
     }
     for (const account of [officer, user(Role.ANALYSTE, 'desk_sud'), user(Role.COORDINATEUR, 'desk_est'), user(Role.ADMIN, 'desk_est')]) {
-      expect((await service.searchObservations({}, account)).count).toBe(0);
+      expect((await service.searchObservations({}, account)).count).toBe(account.sub === officer.sub ? 1 : 0);
       await expect(service.validateObservation(created.id, { target_desks: ['desk_est'] }, account)).rejects.toThrow('cord_intel');
       await expect(service.saveObservation(payload, created.id, account)).rejects.toThrow('cord_intel');
       await expect(service.deleteObservation(created.id, account)).rejects.toThrow('cord_intel');
     }
     await validate(created.id, ['desk_ouest']);
+    await expect(service.getObservationById(created.id, officer)).resolves.toHaveProperty('summary', payload.summary);
     await expect(service.getObservationById(created.id, analyst)).rejects.toThrow('Accès refusé');
     expect((await service.searchObservations({}, adviser)).count).toBe(1);
   });
@@ -69,6 +72,7 @@ describe('Observation validation and desk distribution', () => {
     expect(edited.item.owner_id).toBe(officer.sub);
     expect(edited.item.audit.created_by).toBe(officer.sub);
     expect(edited.item.workflow.status).toBe('pending');
+    await expect(service.getObservationById(created.id, officer)).resolves.toHaveProperty('summary', 'Correction');
     await expect(service.getObservationById(created.id, analyst)).rejects.toThrow('Accès refusé');
     await validate(created.id);
     expect((await service.getObservationById(created.id, analyst)).summary).toBe('Correction');
@@ -95,9 +99,10 @@ describe('Observation validation and desk distribution', () => {
       owner_id: officer.sub, doc_type: 'evidence_video', title: 'secret.mp4', tags: ['evidence', 'observations'], file: { path: 'secret.mp4' },
     });
     const created = await service.saveObservation({ ...payload, evidence: [{ doc_id: docId }] }, undefined, officer);
-    for (const [context, id] of [[undefined, undefined], ['events', 'some-event'], ['observations', created.id]]) {
-      await expect(service.getEvidenceById(docId, officer, context, id)).rejects.toThrow('Accès refusé');
+    for (const [context, id] of [[undefined, undefined], ['events', 'some-event']]) {
+      await expect(service.getEvidenceById(docId, officer, context, id)).rejects.toThrow('associée');
     }
+    await expect(service.getEvidenceById(docId, officer, 'observations', created.id)).resolves.toHaveProperty('title', 'secret.mp4');
     await expect(service.getEvidenceById(docId, analyst, 'observations', created.id)).rejects.toThrow('Accès refusé');
     await expect(service.getPublicDocument(docId)).rejects.toThrow('pièces jointes');
     expect((await service.searchDocuments({})).count).toBe(0);
@@ -107,6 +112,47 @@ describe('Observation validation and desk distribution', () => {
     expect((await service.getEvidenceById(docId, analyst, 'observations', created.id)).title).toBe('secret.mp4');
     await service.deleteObservation(created.id, reviewer);
     await expect(service.getObservationById(created.id, reviewer)).rejects.toThrow('introuvable');
+  });
+
+  it.each([Role.OFFICIER, Role.COORDINATEUR, Role.ADMIN])('lets a %s author read their pending and redistributed records without editing rights', async role => {
+    const author = user(role, 'desk_terrain', `author-${role}`);
+    const colleague = { ...author, sub: 'colleague' };
+    const created = await service.saveObservation(payload, undefined, author);
+    expect((await service.searchObservations({ status: 'pending' }, author)).count).toBe(1);
+    expect((await service.searchObservations({}, colleague)).count).toBe(0);
+    await expect(service.getObservationById(created.id, colleague)).rejects.toThrow('Accès refusé');
+    await validate(created.id, ['desk_est']);
+    const reassigned = { ...author, desk: 'nouveau_desk' };
+    expect((await service.searchObservations({ status: 'validated' }, reassigned)).count).toBe(1);
+    await expect(service.getObservationById(created.id, reassigned)).resolves.toHaveProperty('owner_id', author.sub);
+    await expect(service.saveObservation(payload, created.id, author)).rejects.toThrow('cord_intel');
+    await expect(service.deleteObservation(created.id, author)).rejects.toThrow('cord_intel');
+    await expect(service.validateObservation(created.id, { target_desks: ['desk_est'] }, author)).rejects.toThrow('cord_intel');
+  });
+
+  it('combines own pending information with validated information distributed to the current analyst desk', async () => {
+    const own = await service.saveObservation(payload, undefined, officer);
+    const received = await service.saveObservation(payload, undefined, { ...officer, sub: 'another-author' });
+    await service.saveObservation(payload, undefined, { ...officer, sub: 'private-author' });
+    await validate(received.id);
+    const promoted = { ...officer, role: Role.ANALYSTE };
+    expect((await service.searchObservations({}, promoted)).items.map(item => item._id).sort()).toEqual([own.id, received.id].sort());
+    expect((await service.searchObservations({ status: 'pending' }, promoted)).items.map(item => item._id)).toEqual([own.id]);
+  });
+
+  it('uses legacy creator audit only when no owner exists and fails closed without an identified author', async () => {
+    const key = `/${appConfig.elasticsearch.indexes.observations}/_doc/`;
+    es.documents.set(key + 'legacy-own', { ...payload, audit: { created_by: officer.sub } });
+    es.documents.set(key + 'conflicting-owner', { ...payload, owner_id: 'someone-else', audit: { created_by: officer.sub } });
+    es.documents.set(key + 'unidentified', payload);
+    expect((await service.searchObservations({}, officer)).items.map(item => item._id)).toEqual(['legacy-own']);
+    await expect(service.getObservationById('legacy-own', officer)).resolves.toHaveProperty('summary', payload.summary);
+    for (const id of ['conflicting-owner', 'unidentified']) await expect(service.getObservationById(id, officer)).rejects.toThrow('Accès refusé');
+    expect((await service.searchObservations({})).count).toBe(0);
+    await expect(service.getObservationById('legacy-own')).rejects.toThrow('Accès refusé');
+    const edited = await service.saveObservation({ ...payload, summary: 'Correction de l’ancienne information' }, 'legacy-own', reviewer);
+    expect(edited.item.owner_id).toBe(officer.sub);
+    await expect(service.getObservationById('legacy-own', officer)).resolves.toHaveProperty('summary', 'Correction de l’ancienne information');
   });
 
   it('uses current account assignments instead of stale JWT desks and refuses disabled accounts', async () => {

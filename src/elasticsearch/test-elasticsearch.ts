@@ -7,16 +7,13 @@ export class TestElasticsearch {
   versions = new Map<string, number>();
   request = async (path: string, method: string, body?: any): Promise<any> => {
     const url = new URL(path, 'http://test');
-    const [index, operation, id] = url.pathname.split('/').slice(1);
+    const [index, operation, requestedId] = url.pathname.split('/').slice(1);
+    const id = requestedId ?? `test_${this.documents.size + 1}`;
     const key = `/${index}/_doc/${id}`;
     if (operation === '_search') {
       const all = [...this.documents].filter(([key]) => key.startsWith(`/${index}/_doc/`));
       const matches = all.filter(([, document]) => this.matches(document, body.query));
-      const aggregations: Record<string, any> = {};
-      for (const [name, agg] of Object.entries(body.aggs ?? {}) as [string, any][]) {
-        const desks = [...new Set(matches.map(([, document]) => document[agg.terms.field]).filter(Boolean))];
-        aggregations[name] = { buckets: desks.map(key => ({ key, doc_count: 1 })) };
-      }
+      const aggregations = this.aggregate(matches.map(([, document]) => document), body.aggs ?? {});
       return { aggregations, hits: { total: { value: matches.length }, hits: matches.slice(0, body.size ?? 10).map(([key, source]) => ({
         _id: key.split('/').pop(), _source: structuredClone(source), _seq_no: this.versions.get(key) ?? 0, _primary_term: 1,
       })) } };
@@ -33,10 +30,28 @@ export class TestElasticsearch {
     return { _id: id, result: current ? 'updated' : 'created' };
   };
 
+  private aggregate(documents: any[], definitions: Record<string, any>): Record<string, any> {
+    return Object.fromEntries(Object.entries(definitions).map(([name, agg]) => {
+      if (agg.filter) {
+        const matching = documents.filter(document => this.matches(document, agg.filter));
+        return [name, { doc_count: matching.length, ...this.aggregate(matching, agg.aggs ?? {}) }];
+      }
+      const keys = [...new Set(documents.map(document => document[agg.terms.field]).filter(value => value !== undefined))];
+      return [name, { buckets: keys.slice(0, agg.terms.size ?? 10).map(key => {
+        const matching = documents.filter(document => document[agg.terms.field] === key);
+        return { key, doc_count: matching.length, ...this.aggregate(matching, agg.aggs ?? {}) };
+      }) }];
+    }));
+  }
+
   private matches(document: any, query: any): boolean {
     if (!query || query.match_all) return true;
     if (query.match_none) return false;
     const values = (field: string) => field.split('.').reduce((value, key) => value?.[key], document);
+    if (query.exists) {
+      const value = values(query.exists.field);
+      return Array.isArray(value) ? value.some(item => item !== null && item !== undefined) : value !== null && value !== undefined;
+    }
     if (query.term) return Object.entries(query.term).every(([key, value]) => {
       const actual = values(key); return Array.isArray(actual) ? actual.includes(value) : actual === value;
     });
@@ -45,8 +60,12 @@ export class TestElasticsearch {
     if (query.nested) return (document[query.nested.path] ?? []).some((item: any) => this.matches({ [query.nested.path]: item }, query.nested.query));
     if (query.bool) {
       const array = (value: any) => value ? (Array.isArray(value) ? value : [value]) : [];
-      return [...array(query.bool.filter), ...array(query.bool.must)].every(q => this.matches(document, q)) &&
-        array(query.bool.must_not).every(q => !this.matches(document, q));
+      const must = [...array(query.bool.filter), ...array(query.bool.must)];
+      const should = array(query.bool.should);
+      const minimum = query.bool.minimum_should_match ?? (should.length && !must.length ? 1 : 0);
+      return must.every(q => this.matches(document, q)) &&
+        array(query.bool.must_not).every(q => !this.matches(document, q)) &&
+        should.filter(q => this.matches(document, q)).length >= minimum;
     }
     throw new Error(`Unsupported test query: ${JSON.stringify(query)}`);
   }
