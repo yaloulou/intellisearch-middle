@@ -84,6 +84,44 @@ node node_modules/jest/bin/jest.js src/elasticsearch/ccoc-search.integration.spe
 Ce test crée puis supprime un index temporaire unique avec des données fictives
 et l'analyseur de l'index CCOC configuré. Il ne modifie pas les index applicatifs.
 
+### Tableau de bord CCOC
+
+Le frontend React utilise `POST /api/intel-dashboard/summary` avec `province`,
+`territoire`, `dateFrom` et `dateTo` (dates `AAAA-MM-JJ`). Cette route est réservée
+aux administrateurs et aux analystes du desk CCOC, comme les autres routes CCOC.
+
+Les statistiques sont calculées par agrégations sur toutes les fiches de la
+sélection, indépendamment des limites de chargement des listes. La réponse
+contient `totals`, `previous`, `provinces`, `territories`, `natures`, `actors`,
+`timeline`, `quality`, six fiches récentes et cinq fiches à fort impact au maximum.
+Les acteurs sont comptés par fiche par `reverse_nested`, même en cas de doublons
+dans le tableau `actors`. Les territoires homonymes sont séparés par province.
+
+Par défaut, la période couvre les trente derniers jours, journée en cours
+comprise, en heure de Kinshasa. La comparaison porte sur la période immédiatement
+précédente de même durée. Les dates de fin sont inclusives. L'échelle temporelle
+s'adapte (jour, semaine, mois) et inclut les intervalles sans fait enregistré.
+La durée maximale est de dix ans. Les résultats partiels d'Elasticsearch sont
+rejetés. Les éventuelles estimations ou limites des classements sont signalées.
+
+Le frontend propose des périodes rapides, les provinces et leurs territoires,
+les bilans humains et matériels, la qualité des données et des liens vers les
+fiches. Ces liens utilisent les filtres `actor`, `event` et `impact` de
+`POST /api/intel/search`, en conservant la période et la zone. Les valeurs de
+`impact` sont `civilian_deaths`, `deaths`, `injured`, `missing` et `significant`
+(décès civils ou enlèvements). Le décompte des résultats de recherche est exact.
+L'ancienne route `/api/intel-dashboard/data` reste disponible.
+
+Validation :
+
+```powershell
+node node_modules/jest/bin/jest.js src/elasticsearch/intel-dashboard.spec.ts src/auth/ccoc-access.spec.ts --runInBand
+# Facultatif : Elasticsearch de test, index temporaire et données fictives uniquement.
+$env:CCOC_DASHBOARD_INTEGRATION = '1'
+$env:DASHBOARD_TEST_URL = 'http://127.0.0.1:19200'
+node node_modules/jest/bin/jest.js src/elasticsearch/intel-dashboard.integration.spec.ts --runInBand
+```
+
 ### Pièces jointes des informations et renseignements
 
 Les formulaires Informations (`observations_v1`) et Renseignements (`events_v1`)

@@ -19,6 +19,7 @@ describe('CCOC access through authenticated API routes', () => {
     getIntelProvinces: jest.fn().mockResolvedValue([]),
     getIntelTerritoires: jest.fn().mockResolvedValue([]),
     getIntelDashboard: jest.fn().mockResolvedValue({ items: [] }),
+    getIntelDashboardSummary: jest.fn().mockResolvedValue({ totals: {} }),
     searchObservations: jest.fn().mockResolvedValue({ items: [] }),
   };
   beforeAll(async () => {
@@ -47,6 +48,7 @@ describe('CCOC access through authenticated API routes', () => {
       ['get', '/api/intel-dashboard/provinces'],
       ['get', '/api/intel-dashboard/territoires?province=Test'],
       ['get', '/api/intel-dashboard/data'], ['post', '/api/intel-dashboard/data'],
+      ['post', '/api/intel-dashboard/summary'],
     ];
     for (const [method, url] of calls) {
       await request(app.getHttpServer())[method](url)
@@ -57,6 +59,7 @@ describe('CCOC access through authenticated API routes', () => {
       expect(service.searchIntel).not.toHaveBeenCalled();
       expect(service.saveIntel).not.toHaveBeenCalled();
       expect(service.getIntelDashboard).not.toHaveBeenCalled();
+      expect(service.getIntelDashboardSummary).not.toHaveBeenCalled();
     }
     // This rule does not restrict the Informations module.
     await request(app.getHttpServer()).post('/api/observations/search')

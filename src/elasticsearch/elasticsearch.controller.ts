@@ -202,6 +202,13 @@ export class ElasticsearchController {
 
   // ── Intel Dashboard ──────────────────────────────────────────────────────────
 
+  @Post('intel-dashboard/summary')
+  @Roles(...AnalysteAndAbove)
+  @CcocOnly()
+  getIntelDashboardSummary(@Body() body: IntelDashboardInput = {}) {
+    return this.elasticsearchService.getIntelDashboardSummary(body);
+  }
+
   @Get('intel-dashboard/provinces')
   @Roles(...AnalysteAndAbove)
   @CcocOnly()

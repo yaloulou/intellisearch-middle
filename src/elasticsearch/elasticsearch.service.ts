@@ -6,6 +6,7 @@ import { describeEvidenceFile, normalizeEvidence } from './evidence';
 import type { EvidenceFile, EvidenceRef } from './evidence';
 import { assertObservationReviewer, assertObservationVisible, isObservationReviewer, normalizeDesk, observationVisibility } from './observation-workflow';
 import type { ObservationWorkflow } from './observation-workflow';
+import { dashboardRequest, dashboardResponse, intelImpactFilter } from './intel-dashboard';
 import { appConfig } from '../config/app.config';
 import { Role } from '../common/constants/roles.constant';
 import type { JwtPayload } from '../common/interfaces/jwt-payload.interface';
@@ -235,6 +236,8 @@ export interface SearchIntelInput {
   province_region?: string;
   territoire_ville?: string;
   event?: string;
+  actor?: string;
+  impact?: string;
   dateFrom?: string;
   dateTo?: string;
   size?: number;
@@ -924,9 +927,14 @@ export class ElasticsearchService {
       filters.push({ term: { 'event.event_type': eventType } });
     }
 
+    const actor = this.normalizeString(input.actor);
+    if (actor) filters.push({ nested: { path: 'actors', query: { term: { 'actors.nom': actor } } } });
+    const impactFilter = intelImpactFilter(input.impact);
+    if (impactFilter) filters.push(impactFilter);
+
     const dateRange: Record<string, string> = {};
-    const dateFrom = this.toIsoDate(input.dateFrom);
-    const dateTo = this.toIsoDate(input.dateTo);
+    const dateFrom = this.toIsoDate(input.dateFrom && /^\d{4}-\d{2}-\d{2}$/.test(input.dateFrom) ? `${input.dateFrom}T00:00:00+01:00` : input.dateFrom);
+    const dateTo = this.toIsoDate(input.dateTo && /^\d{4}-\d{2}-\d{2}$/.test(input.dateTo) ? `${input.dateTo}T23:59:59.999+01:00` : input.dateTo);
 
     if (dateFrom) dateRange.gte = dateFrom;
     if (dateTo) dateRange.lte = dateTo;
@@ -974,6 +982,7 @@ export class ElasticsearchService {
         },
       } : {}),
       size,
+      track_total_hits: true,
     };
 
     const response = await this.requestToElasticsearch<ElasticsearchSearchResponse<IntelIncidentDocument>>(
@@ -1118,6 +1127,14 @@ export class ElasticsearchService {
       province: provinceValue,
       items: buckets.map((b) => b.key).filter(Boolean),
     };
+  }
+
+  async getIntelDashboardSummary(input: IntelDashboardInput) {
+    const { body, period } = dashboardRequest(input);
+    const response = await this.requestToElasticsearch<Parameters<typeof dashboardResponse>[0]>(
+      `/${this.intelIndex}/_search?allow_partial_search_results=false`, 'POST', body,
+    );
+    return dashboardResponse(response, period);
   }
 
   async getIntelDashboard(input: IntelDashboardInput) {

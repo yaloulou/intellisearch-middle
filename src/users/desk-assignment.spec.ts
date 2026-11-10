@@ -18,7 +18,7 @@ describe('User desk assignment and observation distribution', () => {
     users = new UsersService();
     observations = new ElasticsearchService();
     es = new TestElasticsearch();
-    searchable = new TestElasticsearch();
+    searchable = new TestElasticsearch(); 
     // GET is real-time in Elasticsearch; searches see only refreshed writes.
     // This catches confirmation of an assignment before it can appear in the desk list.
     const request = async (path: string, method: string, body?: unknown) => {
